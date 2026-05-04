@@ -11,15 +11,18 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <map>
+#include <vector>
 
 // ==================== 构造 / 析构 ====================
 
-Worker::Worker(int client_port, int backend_port, int ring_size, int worker_id)
+Worker::Worker(int client_port, int backend_port, int ring_size, int worker_id,
+               int health_check_port)
     : init_code_(INIT_OK)
     , worker_id_(worker_id)
     , client_port_(client_port)
     , backend_port_(backend_port)
     , ring_size_(ring_size)
+    , health_check_port_(health_check_port)
     , listen_fd_client_(-1)
     , listen_fd_backend_(-1)
     , thread_handle_(0)
@@ -148,7 +151,12 @@ void Worker::worker_loop() {
     submit_accept(&accept_client_ctx_);
     submit_accept(&accept_backend_ctx_);
 
-    // ---- 6. 进入事件循环 ----
+    // ---- 6. 初始化健康检查定时器 ----
+    health_check_timer_ctx_.state = RequestContext::HEALTH_CHECK_TIMER;
+    health_check_timer_ctx_.fd = -1;
+    submit_health_check_timeout();
+
+    // ---- 7. 进入事件循环 ----
     running_ = true;
     LOG_INFO("[Worker %d] 开始事件循环", worker_id_);
 
@@ -196,6 +204,15 @@ void Worker::worker_loop() {
                 submit_accept(request_context);  // 重试
             } else {
                 handle_accept(request_context, operation_result);
+            }
+            continue;
+        }
+
+        // --- 健康检查定时器 ---
+        if (request_context->state == RequestContext::HEALTH_CHECK_TIMER) {
+            if (running_) {
+                perform_health_checks();
+                submit_health_check_timeout();
             }
             continue;
         }
@@ -621,7 +638,8 @@ void Worker::handle_client_read(RequestContext* context, int bytes_read) {
              http_method.c_str(), context->path.c_str());
 
     // 查找后端路由（获取完整 RouteInfo，含鉴权和限流标志）
-    RouteInfo route = router_.lookup(context->path);
+    auto table = route_manager_.get_table();
+    RouteInfo route = table->lookup(context->path);
 
     // 无路由匹配 → 返回 502 Bad Gateway
     if (!route.valid()) {
@@ -678,6 +696,11 @@ void Worker::handle_client_read(RequestContext* context, int bytes_read) {
              worker_id_, context->path.c_str(), route.backend_fd,
              route.need_auth ? "ON" : "OFF",
              route.need_rate_limit ? "ON" : "OFF");
+
+    // 从路由表中移除该后端，防止其他并发客户端继续使用同一后端连接
+    // 通过 RouteManager 执行 COW，Worker 不直接操作路由表
+    route_manager_.remove_backend(route.backend_fd);
+
     context->backend_fd = route.backend_fd;
     context->state = RequestContext::WRITING_BACKEND;
     context->fd = route.backend_fd;
@@ -742,6 +765,9 @@ void Worker::handle_backend_read(RequestContext* context,
     submit_write(context, context->buffer, bytes_read);
 }
 
+// 前向声明
+static void safe_close_fd(int fd, int listen_fd_client, int listen_fd_backend);
+
 void Worker::handle_client_write(RequestContext* context,
                                   int bytes_written) {
     context->bytes_written += bytes_written;
@@ -762,8 +788,43 @@ void Worker::handle_client_write(RequestContext* context,
         context->buffer = nullptr;
     }
 
-    // 关闭连接
-    close_connection(context);
+    // ---- Keep-Alive: 保持后端连接，仅关闭客户端 ----
+    int backend_fd = context->backend_fd;
+    int client_fd  = context->client_fd;
+
+    // 1. 查找后端自己的 RequestContext
+    auto backend_it = ctx_by_fd_.find(backend_fd);
+    if (backend_it != ctx_by_fd_.end()) {
+        RequestContext* backend_ctx = backend_it->second;
+
+        // 2. 将后端设回 BACKEND_IDLE，等待下一个请求
+        backend_ctx->state = RequestContext::BACKEND_IDLE;
+
+        // 3. 通过 RouteManager COW 重新插入路由
+        if (!backend_ctx->registered_prefix.empty()) {
+            route_manager_.insert_backend(
+                backend_ctx->registered_prefix,
+                backend_fd,
+                backend_ctx->registered_auth,
+                backend_ctx->registered_rate_limit);
+        }
+    } else {
+        // 后端上下文已不存在（可能已断开），关闭后端 fd
+        LOG_WARN("[Worker %d] 后端 fd=%d 上下文已不存在，关闭连接",
+                 worker_id_, backend_fd);
+        close_connection(context);
+        return;
+    }
+
+    // 4. 关闭客户端连接
+    safe_close_fd(client_fd, listen_fd_client_, listen_fd_backend_);
+    ctx_by_fd_.erase(client_fd);
+
+    // 5. 清理客户端上下文（但保持后端 fd 和路由不变）
+    if (context != &accept_client_ctx_ &&
+        context != &accept_backend_ctx_) {
+        delete context;
+    }
 }
 
 void Worker::handle_backend_register(RequestContext* context,
@@ -869,10 +930,14 @@ void Worker::handle_backend_register(RequestContext* context,
         }
     }
 
-    // 注册路由
+    // 注册路由（通过 RouteManager COW 插入，Worker 不直接操作路由表）
     if (!route_prefix.empty()) {
-        router_.insert(route_prefix, context->backend_fd,
-                       need_auth, need_rate_limit);
+        route_manager_.insert_backend(route_prefix, context->backend_fd,
+                                      need_auth, need_rate_limit);
+        // 保存注册信息，用于 keep-alive 时重新插入路由
+        context->registered_prefix    = route_prefix;
+        context->registered_auth       = need_auth;
+        context->registered_rate_limit = need_rate_limit;
         LOG_INFO("[Worker %d] 后端注册路由: %s → backend_fd=%d (auth=%s, rate=%s)",
                  worker_id_, route_prefix.c_str(), context->backend_fd,
                  need_auth ? "ON" : "OFF",
@@ -895,7 +960,8 @@ void Worker::handle_backend_register(RequestContext* context,
 // ==================== 辅助方法 ====================
 
 bool Worker::assign_backend(RequestContext* client_context) {
-    RouteInfo route = router_.lookup(client_context->path);
+    auto table = route_manager_.get_table();
+    RouteInfo route = table->lookup(client_context->path);
     if (!route.valid()) {
         return false;
     }
@@ -929,10 +995,10 @@ void Worker::close_connection(RequestContext* context) {
               worker_id_, current_fd, client_fd, backend_fd,
               state_name(context->state));
 
-    // 如果后端已注册，从路由表中移除
-    if (backend_fd >= 0 &&
-        context->state == RequestContext::BACKEND_IDLE) {
-        router_.remove_by_backend(backend_fd);
+    // 如果后端已注册，从路由表中移除（通过 RouteManager COW）
+    // 否则残留路由会导致后续请求写入已关闭的 fd，产生 EBADF
+    if (backend_fd >= 0) {
+        route_manager_.remove_backend(backend_fd);
         LOG_INFO("[Worker %d] 后端 fd=%d 断开，已从路由表移除",
                  worker_id_, backend_fd);
     }
@@ -984,6 +1050,8 @@ const char* Worker::state_name(typename RequestContext::State state) {
             return "BACKEND_REGISTER";
         case RequestContext::BACKEND_IDLE:
             return "BACKEND_IDLE";
+        case RequestContext::HEALTH_CHECK_TIMER:
+            return "HEALTH_CHECK_TIMER";
         default:
             return "UNKNOWN";
     }
@@ -1004,4 +1072,134 @@ std::string Worker::extract_path(const char* buffer, int /*length*/) {
     }
 
     return std::string(path_start, path_end - path_start);
+}
+
+// ==================== 健康检查 ====================
+
+void Worker::submit_health_check_timeout() {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) {
+        LOG_WARN("[Worker %d] 获取 SQE 失败，无法提交健康检查定时器", worker_id_);
+        return;
+    }
+
+    struct __kernel_timespec ts;
+    ts.tv_sec  = HEALTH_CHECK_INTERVAL_SEC;
+    ts.tv_nsec = 0;
+
+    io_uring_prep_timeout(sqe, &ts, 0, 0);
+    io_uring_sqe_set_data(sqe, &health_check_timer_ctx_);
+}
+
+void Worker::perform_health_checks() {
+    LOG_DEBUG("[Worker %d] 执行健康检查...", worker_id_);
+
+    // ---- 第 1 步：收集所有待检查的后端 fd ----
+    // 注意：不能在遍历 ctx_by_fd_ 的过程中调用 close_connection()，
+    // 因为 close_connection() 会 erase 当前迭代器指向的元素
+    std::vector<int> backends_to_check;
+    backends_to_check.reserve(ctx_by_fd_.size());
+    for (const auto& [fd, ctx] : ctx_by_fd_) {
+        // 只检查空闲的后端连接
+        if (ctx->state != RequestContext::BACKEND_IDLE) continue;
+        if (fd == listen_fd_client_ || fd == listen_fd_backend_) continue;
+        if (ctx == &accept_client_ctx_ || ctx == &accept_backend_ctx_) continue;
+        if (ctx == &health_check_timer_ctx_) continue;
+        backends_to_check.push_back(fd);
+    }
+
+    // ---- 第 2 步：逐个创建独立 TCP 连接进行健康检查 ----
+    for (int backend_fd : backends_to_check) {
+        auto it = ctx_by_fd_.find(backend_fd);
+        if (it == ctx_by_fd_.end()) continue;
+        RequestContext* ctx = it->second;
+
+        // 二次检查状态（可能在收集期间变化）
+        if (ctx->state != RequestContext::BACKEND_IDLE) continue;
+
+        // 通过 getpeername() 获取后端 IP 地址
+        struct sockaddr_in peer_addr{};
+        socklen_t addr_len = sizeof(peer_addr);
+        if (::getpeername(backend_fd,
+                          (struct sockaddr*)&peer_addr,
+                          &addr_len) != 0) {
+            LOG_WARN("[Worker %d] 健康检查: getpeername 失败 (fd=%d), errno=%d",
+                     worker_id_, backend_fd, errno);
+            close_connection(ctx);
+            continue;
+        }
+
+        // ---- 创建独立 TCP 连接 ----
+        int hc_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (hc_fd < 0) {
+            LOG_WARN("[Worker %d] 健康检查: socket() 失败 (fd=%d), errno=%d",
+                     worker_id_, backend_fd, errno);
+            continue;
+        }
+
+        // 设置 2 秒超时（连接和收发）
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        ::setsockopt(hc_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        ::setsockopt(hc_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // 连接到后端的健康检查端口（而非业务端口）
+        peer_addr.sin_port = ::htons(
+            static_cast<uint16_t>(health_check_port_));
+
+        int rc = ::connect(hc_fd,
+                           (struct sockaddr*)&peer_addr,
+                           sizeof(peer_addr));
+        if (rc != 0) {
+            LOG_WARN("[Worker %d] 健康检查: connect(%s:%d) 失败, "
+                     "移除后端 fd=%d",
+                     worker_id_,
+                     ::inet_ntoa(peer_addr.sin_addr),
+                     health_check_port_,
+                     backend_fd);
+            ::close(hc_fd);
+            close_connection(ctx);
+            continue;
+        }
+
+        // ---- 发送 GET /health 请求 ----
+        int req_len = static_cast<int>(std::strlen(HEALTH_CHECK_REQUEST));
+        ssize_t sent = ::send(hc_fd, HEALTH_CHECK_REQUEST, req_len, 0);
+        if (sent != req_len) {
+            LOG_WARN("[Worker %d] 健康检查: send() 失败 (fd=%d), 移除后端",
+                     worker_id_, backend_fd);
+            ::close(hc_fd);
+            close_connection(ctx);
+            continue;
+        }
+
+        // ---- 读取响应 ----
+        char response_buf[256];
+        ssize_t bytes_read = ::read(hc_fd,
+                                    response_buf,
+                                    sizeof(response_buf) - 1);
+
+        // 关闭健康检查连接（无论成败）
+        ::close(hc_fd);
+
+        if (bytes_read > 0) {
+            response_buf[bytes_read] = '\0';
+            if (std::strstr(response_buf, "200 OK") != nullptr) {
+                LOG_DEBUG("[Worker %d] 健康检查通过: fd=%d",
+                          worker_id_, backend_fd);
+                // 健康，路由保持不变
+            } else {
+                LOG_WARN("[Worker %d] 健康检查失败 (fd=%d): "
+                         "响应中未找到 200 OK",
+                         worker_id_, backend_fd);
+                close_connection(ctx);
+            }
+        } else {
+            LOG_WARN("[Worker %d] 健康检查失败 (fd=%d): "
+                     "读取响应失败, bytes=%zd",
+                     worker_id_, backend_fd, bytes_read);
+            close_connection(ctx);
+        }
+    }
 }

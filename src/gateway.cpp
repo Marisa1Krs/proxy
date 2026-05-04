@@ -11,13 +11,15 @@ Gateway::Gateway(int client_port,
                  int backend_port,
                  int ring_size,
                  int worker_count,
-                 const std::vector<std::string>& cpu_affinity_masks)
+                 const std::vector<std::string>& cpu_affinity_masks,
+                 int health_check_port)
     : init_code_(INIT_OK)
     , client_port_(client_port)
     , backend_port_(backend_port)
     , ring_size_(ring_size)
     , worker_count_(worker_count)
-    , cpu_affinity_masks_(cpu_affinity_masks) {
+    , cpu_affinity_masks_(cpu_affinity_masks)
+    , health_check_port_(health_check_port) {
 
     // 确保至少有一个 Worker 线程
     if (worker_count_ <= 0) {
@@ -34,7 +36,8 @@ Gateway::Gateway(int client_port,
             client_port_,
             backend_port_,
             ring_size_,
-            worker_index);
+            worker_index,
+            health_check_port_);
 
         // 设置 CPU 亲和性（如果配置了对应的掩码）
         bool has_cpu_affinity =

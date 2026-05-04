@@ -46,12 +46,14 @@ public:
      * @param ring_size           io_uring 队列深度（默认 1024）
      * @param worker_count        Worker 线程数量（默认 1）
      * @param cpu_affinity_masks  每个 Worker 的 CPU 亲和性掩码（可选）
+     * @param health_check_port   后端健康检查端口（默认 9090）
      */
     explicit Gateway(int client_port = 8888,
                      int backend_port = 9999,
                      int ring_size = 1024,
                      int worker_count = 1,
-                     const std::vector<std::string>& cpu_affinity_masks = {});
+                     const std::vector<std::string>& cpu_affinity_masks = {},
+                     int health_check_port = 9090);
     ~Gateway();
 
     Gateway(const Gateway&) = delete;
@@ -73,6 +75,7 @@ private:
     int backend_port_;         ///< 后端监听端口
     int ring_size_;            ///< io_uring 队列深度
     int worker_count_;         ///< Worker 线程数量
+    int health_check_port_;    ///< 健康检查端口
 
     /// 每个 Worker 的 CPU 亲和性掩码字符串列表
     std::vector<std::string> cpu_affinity_masks_;

@@ -28,6 +28,8 @@ struct RouteInfo {
  * 后端服务连接到网关的注册端口后，通过本路由器注册其所处理的路径前缀。
  * 当客户端 HTTP 请求到达时，通过请求路径查找对应的后端连接。
  *
+ * 支持多个后端注册相同路径前缀，查找时返回第一个可用的后端 fd。
+ *
  * 每个路由可配置两个标志：
  *   - need_auth:        是否需要进行 JWT 令牌鉴权
  *   - need_rate_limit:  是否需要进行 IP 限流
@@ -45,9 +47,9 @@ public:
     TrieRouter();
     ~TrieRouter();
 
-    // 禁止拷贝
-    TrieRouter(const TrieRouter&) = delete;
-    TrieRouter& operator=(const TrieRouter&) = delete;
+    // 拷贝构造（深拷贝）
+    TrieRouter(const TrieRouter& other);
+    TrieRouter& operator=(const TrieRouter& other);
 
     // 允许移动
     TrieRouter(TrieRouter&& other) noexcept;
@@ -75,11 +77,13 @@ public:
      *   - 查询 "/api/users/profile" → 返回 "/api/users" 的 RouteInfo
      *   - 查询 "/api/orders"       → 返回 "/api" 的 RouteInfo
      *   - 查询 "/other"            → 返回无效 RouteInfo
+     *
+     * 当多个后端注册同一前缀时，返回第一个可用的后端 fd。
      */
     RouteInfo lookup(const std::string& path) const;
 
     /**
-     * @brief 删除指定前缀的路由
+     * @brief 删除指定前缀的路由（删除所有该前缀注册的后端）
      * @param prefix  要删除的路径前缀
      * @return true   删除成功
      * @return false  该路径不存在或不是路由终点
@@ -107,13 +111,15 @@ private:
      *
      * 每个节点代表路径中的一个字符。
      * is_endpoint 为 true 时，该节点是一个注册的路由终点，
-     * 包含对应的后端 fd 和鉴权/限流配置。
+     * 包含后端 fd 列表和鉴权/限流配置。
+     * 支持多个后端注册同一路径前缀（并发处理）。
      */
     struct TrieNode {
         /// 子节点映射表：字符 → 子节点指针
         std::unordered_map<char, TrieNode*> children;
 
-        int backend_fd       = -1;   ///< 后端 fd（仅当 is_endpoint 时有效）
+        /// 注册在该前缀上的所有后端 fd 列表（支持多后端并发）
+        std::vector<int> backend_fds;
         bool is_endpoint     = false;///< 该节点是否为一个注册的路由终点
         bool need_auth       = false;///< 是否需要 JWT 鉴权
         bool need_rate_limit = false;///< 是否需要 IP 限流

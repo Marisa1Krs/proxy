@@ -9,7 +9,7 @@
 
 #include "auth.h"
 #include "rate_limiter.h"
-#include "router.h"
+#include "route_manager.h"
 
 /**
  * @brief 工作线程 —— 独立的事件循环（SO_REUSEPORT + 独立 io_uring）
@@ -18,7 +18,7 @@
  *   - io_uring 实例
  *   - SO_REUSEPORT 监听套接字（同一个端口可被多个 Worker 同时监听）
  *   - Provided Buffers 池（64 个 4KB 缓冲区）
- *   - 路由表（TrieRouter）
+ *   - 路由表（RouteManager + COW RouteTable，只读访问）
  *   - 连接上下文映射表
  *
  * 核心架构：状态机 + IOSQE_BUFFER_SELECT
@@ -29,6 +29,10 @@
  *
  * 状态流转（后端注册）：
  *   ACCEPTING → BACKEND_REGISTER → BACKEND_IDLE
+ *
+ * 健康检查（每 5 秒）：
+ *   HEALTH_CHECK_TIMER → 遍历 BACKEND_IDLE → WRITING_BACKEND
+ *                      → READING_BACKEND → BACKEND_IDLE / 移除路由
  */
 class Worker {
 public:
@@ -42,12 +46,14 @@ public:
 
     /**
      * @brief 构造 Worker
-     * @param client_port  客户端监听端口（默认 8888）
-     * @param backend_port 后端监听端口（默认 9999）
-     * @param ring_size    io_uring 队列深度（默认 1024）
-     * @param worker_id    Worker 编号（日志用）
+     * @param client_port       客户端监听端口（默认 8888）
+     * @param backend_port      后端监听端口（默认 9999）
+     * @param ring_size         io_uring 队列深度（默认 1024）
+     * @param worker_id         Worker 编号（日志用）
+     * @param health_check_port 健康检查端口（默认 9090）
      */
-    Worker(int client_port, int backend_port, int ring_size, int worker_id);
+    Worker(int client_port, int backend_port, int ring_size, int worker_id,
+           int health_check_port = 9090);
     ~Worker();
 
     Worker(const Worker&) = delete;
@@ -85,6 +91,16 @@ private:
     static constexpr int MAX_RING_SIZE  = 4096;  ///< io_uring 最大队列深度
     static constexpr int BACKLOG        = 128;   ///< listen 积压数
 
+    /// 健康检查请求字符串（GET /health，Connection: close 确保后端发完即关）
+    static constexpr const char* HEALTH_CHECK_REQUEST =
+        "GET /health HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    /// 健康检查间隔（秒）
+    static constexpr int HEALTH_CHECK_INTERVAL_SEC = 5;
+
     // ==================== 连接上下文 ====================
     /**
      * @brief 请求上下文（状态机）
@@ -96,13 +112,14 @@ private:
     struct RequestContext {
         /// 状态枚举
         enum State : int {
-            ACCEPTING,          ///< 监听套接字：等待 accept 完成
-            READING_CLIENT,     ///< 从客户端读取 HTTP 请求
-            WRITING_BACKEND,    ///< 将客户端请求写入后端
-            READING_BACKEND,    ///< 从后端读取 HTTP 响应
-            WRITING_CLIENT,     ///< 将后端响应写回客户端
-            BACKEND_REGISTER,   ///< 读取后端注册消息
-            BACKEND_IDLE,       ///< 后端注册完毕，等待被分配请求
+            ACCEPTING,           ///< 监听套接字：等待 accept 完成
+            READING_CLIENT,      ///< 从客户端读取 HTTP 请求
+            WRITING_BACKEND,     ///< 将客户端请求写入后端
+            READING_BACKEND,     ///< 从后端读取 HTTP 响应
+            WRITING_CLIENT,      ///< 将后端响应写回客户端
+            BACKEND_REGISTER,    ///< 读取后端注册消息
+            BACKEND_IDLE,        ///< 后端注册完毕，等待被分配请求
+            HEALTH_CHECK_TIMER,  ///< 健康检查定时器已触发
         };
 
         State state;                ///< 当前状态
@@ -115,6 +132,11 @@ private:
         int total_bytes;            ///< 需写入的总字节数
         std::string path;           ///< HTTP 请求路径（路由匹配用）
         std::string client_ip;      ///< 客户端 IP 地址（限流用）
+
+        // ---- 后端保持连接（keep-alive）字段 ----
+        std::string registered_prefix;   ///< 后端注册的路径前缀（如 "/"）
+        bool registered_auth       = false; ///< 后端注册的鉴权标志
+        bool registered_rate_limit = false; ///< 后端注册的限流标志
 
         RequestContext()
             : state(ACCEPTING)
@@ -149,13 +171,19 @@ private:
     char buffers_[NUM_BUFFERS][BUFFER_SIZE];
     bool buffer_free_[NUM_BUFFERS];
 
-    // ---- 路由和限流 ----
-    TrieRouter router_;
+    // ---- COW 路由表管理器 + 限流 ----
+    RouteManager route_manager_;
     RateLimiter rate_limiter_;
 
     // ---- accept 上下文（成员变量，不 heap 分配） ----
     RequestContext accept_client_ctx_;
     RequestContext accept_backend_ctx_;
+// ---- 健康检查定时器上下文（成员变量） ----
+RequestContext health_check_timer_ctx_;
+
+// ---- 健康检查端口 ----
+int health_check_port_;
+
 
     // ---- fd → RequestContext 映射 ----
     std::unordered_map<int, RequestContext*> ctx_by_fd_;
@@ -229,6 +257,14 @@ private:
 
     /// 提交 write 请求（使用 context 中的 buffer + bytes_written + total_bytes）
     void submit_write_remain(RequestContext* context);
+// ---- 健康检查 ----
+
+/// 提交 IORING_OP_TIMEOUT（5 秒间隔）
+void submit_health_check_timeout();
+
+/// 遍历所有已注册后端，为每个后端创建独立 TCP 连接执行健康检查
+void perform_health_checks();
+
 
     // ---- 事件处理器 ----
 
@@ -241,7 +277,7 @@ private:
     /// 客户端 write 完成：处理 partial write 或关闭连接
     void handle_client_write(RequestContext* context, int bytes_written);
 
-    /// 后端 read 完成：将响应写回客户端
+    /// 后端 read 完成：将响应写回客户端（或处理健康检查响应）
     void handle_backend_read(RequestContext* context, int bytes_read);
 
     /// 后端 write 完成：处理 partial write 或发起后端 read
@@ -252,10 +288,10 @@ private:
 
     // ---- 辅助方法 ----
 
-    /// 分配后端 fd 给客户端上下文（从 Trie 路由表查找）
+    /// 分配后端 fd 给客户端上下文（从 COW 路由表查找）
     bool assign_backend(RequestContext* client_context);
 
-    /// 关闭连接并清理上下文
+    /// 关闭连接并清理上下文（通知 RouteManager 移除路由）
     void close_connection(RequestContext* context);
 
     /// 获取状态名称（用于日志输出）
