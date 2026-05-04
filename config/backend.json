@@ -1,0 +1,9 @@
+{
+    "mode": "backend",
+    "prefix": "/api",
+    "need_auth": false,
+    "need_rate_limit": false,
+    "listen_port": 9090,
+    "gw_host": "127.0.0.1",
+    "gw_backend_port": 9999
+}
