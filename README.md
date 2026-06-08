@@ -6,16 +6,16 @@ MarisaProxy 是一个基于 Linux **io_uring** 异步 I/O 框架开发的高性�
 
 设计目标：
 - **极致性能**：充分发挥 io_uring 零拷贝、内核态 I/O 的优势
-- **无锁架构**：每个 Worker 独立运行，无共享状态争抢
-- **热加载路由**：Copy-on-Write 路由表，后端注册/注销不影响正在处理的请求
+- **无锁架构**：每个 Worker 独立运行，线程本地连接池，零共享状态
+- **线程本地连接池**：每个 Worker 独立维护后端连接，无需任何同步机制
 - **独立健康检查**：健康检查使用独立 TCP 连接，绝不干扰业务连接池
 
 ### 核心特性
 
 - **io_uring 异步 I/O**：使用 Linux 5.1+ 的 io_uring 接口，支持 IOSQE_BUFFER_SELECT 自动缓冲区管理
 - **多 Worker 并行**：SO_REUSEPORT 多进程/线程模型，内核自动负载均衡
-- **前缀树路由（Trie）**：最长前缀匹配，O(n) 时间复杂度，支持多个后端绑定同一前缀（负载均衡）
-- **Copy-on-Write 路由表**：后端注册/注销时原子替换路由表版本，不阻塞正在处理的请求
+- **线程本地连接池**：每个 Worker 拥有独立的 BackendPool，后端连接完全隔离，无需锁或原子操作
+- **独占式后端分配**：acquire() 从空闲队列取出后端，release() 放回，天然避免并发写入同一 socket
 - **独立健康检查**：定时器触发后，为每个后端创建独立 TCP 连接执行 `GET /health`，不复用业务连接池
 - **JWT 令牌鉴权**：基于 jwt-cpp 头文件库，HS256 签名验证
 - **IP 限流**：滑动窗口算法，每 IP 每秒可自定义最大请求数
@@ -64,10 +64,8 @@ make -j$(nproc)
 Proxy/
 ├── include/                  # 头文件目录
 │   ├── auth.h               # JWT 令牌鉴权封装（HS256）
+│   ├── backend_pool.h       # 线程本地后端连接池（BackendPool）
 │   ├── gateway.h            # 网关编排器（多 Worker 管理/优雅关闭）
-│   ├── router.h             # 前缀树（Trie）路由器（多后端支持）
-│   ├── route_table.h        # COW 路由表（Copy-on-Write 原子替换）
-│   ├── route_manager.h      # 路由管理器（COW 封装 + 版本号管理）
 │   ├── rate_limiter.h       # 基于 IP 的滑动窗口限流器
 │   ├── worker.h             # Worker 工作线程（io_uring 事件循环/状态机/健康检查）
 │   ├── mylog.h              # 无锁日志模块
@@ -79,8 +77,7 @@ Proxy/
 │   ├── main.cpp             # 程序入口，信号处理，配置加载
 │   ├── gateway.cpp          # Gateway 编排器实现
 │   ├── worker.cpp           # Worker 事件循环/状态机/健康检查实现
-│   ├── router.cpp           # Trie 路由器实现（前缀插入/查找/删除）
-│   ├── route_manager.cpp    # COW 路由表管理器实现
+│   ├── backend_pool.cpp     # BackendPool 连接池实现
 │   └── mylog.cpp            # 日志模块实现
 ├── cli/                      # CLI 测试客户端
 │   ├── cli_client.cpp       # 后端模拟 + 客户端模拟 + QPS 压测（含健康检查监听器）
@@ -108,7 +105,7 @@ Proxy/
 │  │  ┌───────────┐  │  │  ┌───────────┐  │  │  ...      │ │
 │  │  │ io_uring₀  │  │  │ │ io_uring₁  │  │  │           │ │
 │  │  │ Ring=1024  │  │  │ │ Ring=1024  │  │  │           │ │
-│  │  │ COW 路由表 │  │  │ │ COW 路由表 │  │  │           │ │
+│  │  │BackendPool │  │  │ │BackendPool │  │  │           │ │
 │  │  │ 健康检查   │  │  │ │ 健康检查   │  │  │           │ │
 │  │  └───────────┘  │  │  └───────────┘  │  │           │ │
 │  │  SO_REUSEPORT    │  │  SO_REUSEPORT    │  │           │ │
@@ -132,7 +129,7 @@ READING_CLIENT  ← 读取 HTTP 请求
   ↓
 （鉴权/限流检查）
   ↓
-ASSIGN_BACKEND  ← COW 路由表查找后端
+ACQUIRE_BACKEND ← BackendPool 获取后端 fd（acquire 独占）
   ↓
 WRITING_BACKEND ← 将请求转发给后端（支持 partial write）
   ↓
@@ -166,36 +163,45 @@ HEALTH_CHECK_TIMER  ← io_uring IORING_OP_TIMEOUT 完成
     → recv("200 OK" 检查)
     → close()
   ↓
-健康 → 路由保持不变
-不健康 → route_manager_.remove_backend(backend_fd) + close_connection()
+健康 → 连接池保持不变
+不健康 → backend_pool_.remove(backend_fd) + close_connection()
 ```
 
-### Copy-on-Write 路由表设计
+### BackendPool 线程本地连接池设计
 
 ```
-                    ┌──────────────────────┐
-                    │    RouteManager       │
-                    │  current_table_ ———┐  │
-                    │  pending_table_ ──┐│  │
-                    │  version_        ││  │
-                    └──────────────────┼┼──┘
-                                       ││
-          ┌────────────────────────────┘│
-          ▼                             ▼
-┌──────────────────┐        ┌──────────────────┐
-│ RouteTable v1    │        │ RouteTable v2    │
-│ (被读取中)       │        │ (新版本，构建中) │
-│ ref_count > 0    │        │ 构建完成后原子   │
-│                  │        │ 替换 current     │
-└──────────────────┘        │ 旧版本延迟释放   │
-                            └──────────────────┘
+┌────────────────────────────────────────────────────┐
+│              Worker 内部（单线程）                    │
+│                                                     │
+│  BackendPool                                         │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  entries_ (fd → PoolEntry)                    │  │
+│  │  ┌──────────┬──────────┬──────────┬────────┐ │  │
+│  │  │ fd=10    │ fd=11    │ fd=12    │ fd=13  │ │  │
+│  │  │ /api     │ /api     │ /api     │ /img   │ │  │
+│  │  │ in_use=✓ │ in_use=✗ │ in_use=✗ │ in_use=✗│ │  │
+│  │  └──────────┴──────────┴──────────┴────────┘ │  │
+│  │                                                │  │
+│  │  idle_queue_ (FIFO 空闲 fd)                    │  │
+│  │  ┌──────┬──────┬──────┐                        │  │
+│  │  │ fd=11│ fd=12│ fd=13│  ← acquire 从头取      │  │
+│  │  └──────┴──────┴──────┘     release 放回尾      │  │
+│  └──────────────────────────────────────────────┘  │
+│                                                     │
+│  操作：                                              │
+│  add(fd, prefix, auth, rate)    ← 后端注册时        │
+│  acquire(path, &auth, &rate)    ← 客户端请求时      │
+│  release(fd)                    ← 响应完成后        │
+│  remove(fd)                     ← 连接断开时        │
+└────────────────────────────────────────────────────┘
 ```
 
-COW 路由表的核心思想：
-1. **读不阻塞写**：Worker 查找路由时直接读 `current_table_` 指针，无需加锁
-2. **写不影响读**：后端注册/注销时，构建一个新 `RouteTable` 副本，原子替换指针
-3. **延迟释放**：被替换的旧版本在被所有读操作释放后，自动析构
-4. **版本号管理**：每次写操作递增版本号，便于调试和验证
+BackendPool 的核心思想：
+1. **线程本地，无需锁**：每个 Worker 拥有自己的 BackendPool，单线程访问，零同步开销
+2. **FIFO 公平调度**：`acquire` 从空闲队列头部取，`release` 放回尾部，公平分配
+3. **独占式后端分配**：`acquire` 将后端标记为 `in_use=true` 并移出空闲队列，天然避免同一 fd 被并发写入
+4. **最长前缀匹配**：`acquire(path)` 遍历空闲队列，找到前缀最匹配的后端
+5. **零竞态条件**：没有共享指针、没有 COW、没有 deep copy，每个 Worker 完全独立
 
 ### 健康检查架构
 
@@ -220,8 +226,8 @@ COW 路由表的核心思想：
 │  │  5. recv() → 检查 "200 OK"                      │  │
 │  │  6. close() → 立即关闭健康检查连接              │  │
 │  │                                                 │  │
-│  │  健康 → 路由保持不变                            │  │
-│  │  不健康 → route_manager_.remove_backend()      │  │
+│  │  健康 → 连接池保持不变                          │  │
+│  │  不健康 → backend_pool_.remove(backend_fd)     │  │
 │  │          + close_connection()                   │  │
 │  └────────────────────────────────────────────────┘  │
 │                                                       │
@@ -241,8 +247,13 @@ COW 路由表的核心思想：
     "client_port": 8888,           // 客户端监听端口
     "backend_port": 9999,          // 后端注册端口
     "ring_size": 1024,             // io_uring 队列深度
-    "worker_processes": 1,         // Worker 线程数量
-    "worker_cpu_affinity": ["0001"],  // CPU 亲和性掩码
+    "worker_processes": 8,         // Worker 线程数量
+    "worker_cpu_affinity": [       // CPU 亲和性掩码（与 Worker 逐一对应）
+        "00000001","00000010",     // Worker 0→CPU0, Worker 1→CPU1
+        "00000100","00001000",     // Worker 2→CPU2, Worker 3→CPU3
+        "00010000","00100000",     // Worker 4→CPU4, Worker 5→CPU5
+        "01000000","10000000"      // Worker 6→CPU6, Worker 7→CPU7
+    ],
     "health_check_port": 9090,     // 健康检查端口（后端需在此端口监听 /health）
     "log_level": 1,                // 日志级别 (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=FATAL)
     "log_file": "./log/gateway.log" // 日志文件路径
@@ -523,9 +534,9 @@ perform_health_checks()
 │    recv() → 检查 "200 OK"         │
 │    close() → 立即关闭             │
 │                                   │
-│    健康？→ 路由保持不变            │
-│    不健康？→ remove_backend()     │
-│              + close_connection() │
+│    健康？→ 连接池保持不变           │
+│    不健康？→ backend_pool_.remove(fd) │
+│              + close_connection()    │
 └───────────────────────────────────┘
 ```
 
@@ -540,12 +551,11 @@ perform_health_checks()
 
 ### 添加新功能
 
-1. **路由相关**：修改 [`include/router.h`](include/router.h) 和 [`src/router.cpp`](src/router.cpp) 中的 `RouteInfo` 结构体或 `TrieRouter` 类
+1. **连接池策略**：修改 [`include/backend_pool.h`](include/backend_pool.h) 和 [`src/backend_pool.cpp`](src/backend_pool.cpp) 中的 `BackendPool` 类，调整 `acquire()` 的前缀匹配算法
 2. **鉴权方式**：修改 [`include/auth.h`](include/auth.h)，支持更多 JWT 算法或自定义鉴权
 3. **限流策略**：修改 [`include/rate_limiter.h`](include/rate_limiter.h)，支持令牌桶等算法
 4. **协议支持**：修改 [`src/worker.cpp`](src/worker.cpp) 中的 `parse_http_request()`，支持 HTTP/2 或 WebSocket
 5. **健康检查逻辑**：修改 [`src/worker.cpp`](src/worker.cpp) 中的 `perform_health_checks()` 和 `submit_health_check_timeout()`
-6. **COW 路由表**：修改 [`include/route_table.h`](include/route_table.h) 和 [`src/route_manager.cpp`](src/route_manager.cpp)
 
 ### 代码风格
 

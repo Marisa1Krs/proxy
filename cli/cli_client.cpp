@@ -518,6 +518,16 @@ struct BenchmarkResult {
     std::atomic<uint64_t> error_count{0};
     std::atomic<uint64_t> backend_reconnects{0};
     std::atomic<uint64_t> backend_errors{0};
+
+    // 详细失败分类（压测客户端用）
+    std::atomic<uint64_t> connect_failures{0};     // tcp_connect 失败
+    std::atomic<uint64_t> send_failures{0};        // 发送请求失败
+    std::atomic<uint64_t> recv_failures{0};        // recv_all 返回 <=0
+    std::atomic<uint64_t> recv_econnreset{0};      // 接收时 ECONNRESET
+    std::atomic<uint64_t> recv_etimedout{0};       // 接收超时 (无数据)
+    std::atomic<uint64_t> recv_eof{0};             // 连接直接关闭 (无数据)
+    std::atomic<uint64_t> recv_other{0};           // 其他接收错误
+    std::atomic<uint64_t> response_failures{0};    // 响应不含 "200 OK"
 };
 
 /**
@@ -638,8 +648,10 @@ static void benchmark_backend_worker(const BenchmarkConfig& config,
     control.backend_ready.store(false, std::memory_order_relaxed);
     std::atomic<bool> first_ready{false};
 
-    // 连接池大小 = 客户端线程数 * 2（最少 4 个，最多 64 个）
-    int pool_size = std::max(config.thread_count * 2, 4);
+    // 连接池大小 = 客户端线程数 * 6（最少 16 个，最多 64 个）
+    // 多 Worker 场景下（8 Worker × 8 后端 = 64），
+    // 确保每个 Worker 有足够后端处理突发并发
+    int pool_size = std::max(config.thread_count * 6, 16);
     if (pool_size > 64) pool_size = 64;
 
     std::cout << "[Bench-Backend] 启动 " << pool_size << " 路后端连接..."
@@ -714,6 +726,7 @@ static void benchmark_client_worker(const BenchmarkConfig& config,
             config.gateway_host, config.gateway_client_port);
         if (socket_fd < 0) {
             result.error_count.fetch_add(1, std::memory_order_relaxed);
+            result.connect_failures.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
@@ -732,6 +745,7 @@ static void benchmark_client_worker(const BenchmarkConfig& config,
         if (!send_ok) {
             ::close(socket_fd);
             result.error_count.fetch_add(1, std::memory_order_relaxed);
+            result.send_failures.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
@@ -749,9 +763,30 @@ static void benchmark_client_worker(const BenchmarkConfig& config,
                 result.success_count.fetch_add(1, std::memory_order_relaxed);
             } else {
                 result.error_count.fetch_add(1, std::memory_order_relaxed);
+                result.response_failures.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
             result.error_count.fetch_add(1, std::memory_order_relaxed);
+            result.recv_failures.fetch_add(1, std::memory_order_relaxed);
+            // 追踪具体的接收错误原因
+            if (bytes_received == 0) {
+                result.recv_eof.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // bytes_received == -1: 检查 errno
+                // EAGAIN 和 EWOULDBLOCK 在 Linux 上值相同
+                int recv_err = errno;
+                switch (recv_err) {
+                    case ECONNRESET:
+                        result.recv_econnreset.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case EAGAIN:
+                        result.recv_etimedout.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    default:
+                        result.recv_other.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                }
+            }
         }
     }
 }
@@ -924,6 +959,14 @@ static int run_benchmark_mode(const BenchmarkConfig& config) {
               << (total_requests > 0
                   ? (100.0 * total_success / total_requests) : 0.0)
               << "%" << std::endl;
+    std::cout << "  ├─ 连接失败:    " << result.connect_failures.load() << std::endl;
+    std::cout << "  ├─ 发送失败:    " << result.send_failures.load() << std::endl;
+    std::cout << "  ├─ 接收失败:    " << result.recv_failures.load() << std::endl;
+    std::cout << "  │  ├─ EOF:      " << result.recv_eof.load() << std::endl;
+    std::cout << "  │  ├─ RST:      " << result.recv_econnreset.load() << std::endl;
+    std::cout << "  │  ├─ 超时:     " << result.recv_etimedout.load() << std::endl;
+    std::cout << "  │  └─ 其他:     " << result.recv_other.load() << std::endl;
+    std::cout << "  └─ 响应不含200: " << result.response_failures.load() << std::endl;
     std::cout << "  后端重连次数:  " << result.backend_reconnects.load() << std::endl;
     std::cout << "  后端错误次数:  " << result.backend_errors.load() << std::endl;
     std::cout << "  QPS:           " << std::fixed << std::setprecision(2)

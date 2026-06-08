@@ -3,13 +3,14 @@
 #include <liburing.h>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <pthread.h>
 #include <string>
 #include <unordered_map>
 
 #include "auth.h"
 #include "rate_limiter.h"
-#include "route_manager.h"
+#include "backend_pool.h"
 
 /**
  * @brief 工作线程 —— 独立的事件循环（SO_REUSEPORT + 独立 io_uring）
@@ -18,7 +19,7 @@
  *   - io_uring 实例
  *   - SO_REUSEPORT 监听套接字（同一个端口可被多个 Worker 同时监听）
  *   - Provided Buffers 池（64 个 4KB 缓冲区）
- *   - 路由表（RouteManager + COW RouteTable，只读访问）
+ *   - 后端连接池（BackendPool，线程本地，无锁）
  *   - 连接上下文映射表
  *
  * 核心架构：状态机 + IOSQE_BUFFER_SELECT
@@ -171,22 +172,41 @@ private:
     char buffers_[NUM_BUFFERS][BUFFER_SIZE];
     bool buffer_free_[NUM_BUFFERS];
 
-    // ---- COW 路由表管理器 + 限流 ----
-    RouteManager route_manager_;
+    // ---- 后端连接池（每个 Worker 独立拥有，无锁） + 限流 ----
+    BackendPool backend_pool_;
     RateLimiter rate_limiter_;
 
     // ---- accept 上下文（成员变量，不 heap 分配） ----
     RequestContext accept_client_ctx_;
     RequestContext accept_backend_ctx_;
-// ---- 健康检查定时器上下文（成员变量） ----
-RequestContext health_check_timer_ctx_;
 
-// ---- 健康检查端口 ----
-int health_check_port_;
+    // ---- 健康检查定时器上下文（成员变量） ----
+    RequestContext health_check_timer_ctx_;
 
+    // ---- 健康检查端口 ----
+    int health_check_port_;
 
-    // ---- fd → RequestContext 映射 ----
+    /**
+     * @brief fd → RequestContext 映射表
+     *
+     * 记录当前 Worker 管理的所有 socket 文件描述符对应的请求上下文。
+     * 包括：客户端连接、后端连接、监听套接字（listen_fd_client_ / listen_fd_backend_）。
+     * 用于在事件循环中根据 fd 查找对应的连接状态。
+     */
     std::unordered_map<int, RequestContext*> ctx_by_fd_;
+
+    /**
+     * @brief 等待后端的请求队列（FIFO）
+     *
+     * 当所有后端连接都处于忙碌状态（已被分配处理某个请求）时，
+     * 新到达的客户端请求会暂时存入此队列。
+     * 每当 backend 完成请求重新插入路由表后，会调用 process_pending_requests()
+     * 从队列头部取出等待最久的请求进行处理，确保公平性。
+     *
+     * 详细设计参见 process_pending_requests() 的实现注释。
+     */
+    std::deque<RequestContext*> pending_clients_;
+
 
     // ---- 线程控制 ----
     pthread_t thread_handle_;
@@ -257,14 +277,14 @@ int health_check_port_;
 
     /// 提交 write 请求（使用 context 中的 buffer + bytes_written + total_bytes）
     void submit_write_remain(RequestContext* context);
-// ---- 健康检查 ----
 
-/// 提交 IORING_OP_TIMEOUT（5 秒间隔）
-void submit_health_check_timeout();
+    // ---- 健康检查 ----
 
-/// 遍历所有已注册后端，为每个后端创建独立 TCP 连接执行健康检查
-void perform_health_checks();
+    /// 提交 IORING_OP_TIMEOUT（5 秒间隔）
+    void submit_health_check_timeout();
 
+    /// 遍历所有已注册后端，为每个后端创建独立 TCP 连接执行健康检查
+    void perform_health_checks();
 
     // ---- 事件处理器 ----
 
@@ -288,11 +308,14 @@ void perform_health_checks();
 
     // ---- 辅助方法 ----
 
-    /// 分配后端 fd 给客户端上下文（从 COW 路由表查找）
+    /// 分配后端 fd 给客户端上下文（从 BackendPool 获取）
     bool assign_backend(RequestContext* client_context);
 
-    /// 关闭连接并清理上下文（通知 RouteManager 移除路由）
+    /// 关闭连接并清理上下文（从 BackendPool 移除）
     void close_connection(RequestContext* context);
+
+    /// 当后端变为空闲时，处理等待队列中的请求
+    void process_pending_requests();
 
     /// 获取状态名称（用于日志输出）
     static const char* state_name(typename RequestContext::State state);

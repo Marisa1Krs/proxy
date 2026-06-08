@@ -14,6 +14,11 @@
 #include <vector>
 
 // ==================== 构造 / 析构 ====================
+//
+// Worker 构造函数：初始化配置参数、标记所有缓冲区为可用状态。
+// 注意：io_uring 和监听套接字的初始化在 worker_loop() 中完成，
+// 因为后者运行在 Worker 线程上下文中。
+//
 
 Worker::Worker(int client_port, int backend_port, int ring_size, int worker_id,
                int health_check_port)
@@ -37,7 +42,10 @@ Worker::Worker(int client_port, int backend_port, int ring_size, int worker_id,
 Worker::~Worker() {
     stop();
 
-    // 关闭所有连接的上下文
+    // ---- 清理流程 ----
+    // 1. 关闭所有连接上下文中的 socket fd（跳过监听套接字）
+    // 2. 关闭监听套接字
+    // 3. 退出 io_uring 队列
     for (auto& [fd, context] : ctx_by_fd_) {
         if (fd == listen_fd_client_ || fd == listen_fd_backend_) {
             continue;
@@ -70,6 +78,21 @@ void Worker::set_cpu_affinity(const std::string& mask) {
 }
 
 // ==================== 工作线程主循环 ====================
+//
+// worker_loop() 是每个 Worker 线程的入口函数，执行以下步骤：
+//   0. 绑定 CPU 亲和性（如果配置了掩码）
+//   1. 初始化 io_uring 实例（队列深度 = ring_size_）
+//   2. 初始化 Provided Buffers 池（64 个 4KB 缓冲区）
+//   3. 创建两个 SO_REUSEPORT 监听套接字（客户端端口 + 后端端口）
+//   4. 初始化 Accept 上下文
+//   5. 提交初始 Accept 请求（开始接受新连接）
+//   6. 初始化健康检查定时器
+//   7. 进入事件循环（io_uring_submit → io_uring_wait_cqe → 状态机派发）
+//
+// 注意：io_uring 是异步 I/O 框架，所有 I/O 操作（accept/read/write）
+// 都通过提交 SQE（Submission Queue Entry）发起，通过 CQE（Completion
+// Queue Entry）获取结果。状态机驱动每个连接的生命周期。
+//
 
 void Worker::worker_loop() {
     // 记录当前线程句柄，用于 Gateway::stop() 发送唤醒信号
@@ -160,8 +183,30 @@ void Worker::worker_loop() {
     running_ = true;
     LOG_INFO("[Worker %d] 开始事件循环", worker_id_);
 
+    //
+    // ================ 核心事件循环 ================
+    //
+    // 循环流程：
+    //   1. io_uring_submit()  → 批量提交所有待处理的 SQE
+    //   2. io_uring_wait_cqe() → 等待内核完成至少一个操作
+    //   3. 根据 CQE 中的上下文状态，派发给对应的事件处理器
+    //
+    // 状态机派发优先级：
+    //   a) ACCEPTING（新连接）→ handle_accept()
+    //   b) HEALTH_CHECK_TIMER → perform_health_checks()
+    //   c) 操作失败（res < 0）→ close_connection()
+    //   d) READING_CLIENT/READING_BACKEND:
+    //      从 completion_flags 中提取 IOSQE_BUFFER_SELECT 分配的 buffer_id
+    //   e) WRITING_BACKEND / WRITING_CLIENT / BACKEND_REGISTER
+    //
+    // 注意：READING_CLIENT 和 READING_BACKEND 使用 IOSQE_BUFFER_SELECT，
+    // 由内核自动提供缓冲区，无需用户预先分配。CQE 的 flags 高位 16 位存
+    // 储 buffer_id，用于回收缓冲区。
+    //
     while (running_) {
         // 批量提交所有待处理的 SQE
+        // io_uring_submit() 会将 SQ（Submission Queue）中所有待处理的
+        // SQE 一次性提交给内核，减少系统调用次数。
         int submitted_count = io_uring_submit(&ring_);
         if (submitted_count < 0) {
             LOG_ERROR("[Worker %d] io_uring_submit 失败: %s",
@@ -170,6 +215,9 @@ void Worker::worker_loop() {
         }
 
         // 等待内核完成事件
+        // io_uring_wait_cqe() 阻塞直到至少有一个 CQE 可用。
+        // 当 Gateway::stop() 发送 SIGUSR1 时，wait 会被 -EINTR 中断，
+        // 此时检查 running_ 标志决定是否退出循环。
         io_uring_cqe* completion_event;
         int wait_result = io_uring_wait_cqe(&ring_, &completion_event);
         if (wait_result < 0) {
@@ -182,21 +230,32 @@ void Worker::worker_loop() {
             break;
         }
 
-        // 取出上下文
+        // 从 CQE 中取出上下文指针和操作结果
+        // io_uring_cqe_get_data() 返回提交 SQE 时通过 io_uring_sqe_set_data()
+        // 设置的 RequestContext 指针。
         auto* request_context =
             static_cast<RequestContext*>(io_uring_cqe_get_data(completion_event));
-        int operation_result   = completion_event->res;
-        int completion_flags   = completion_event->flags;
-        io_uring_cqe_seen(&ring_, completion_event);
+        int operation_result   = completion_event->res;   // 操作返回值（如 read 字节数、accept 新 fd）
+        int completion_flags   = completion_event->flags;  // 完成标志（含 buffer_id）
+        io_uring_cqe_seen(&ring_, completion_event);        // 通知内核该 CQE 已消费
 
-        // 跳过没有上下文的完成事件（如 PROVIDE_BUFFERS 回收）
+        // 跳过没有上下文的完成事件
+        // PROVIDE_BUFFERS 操作（缓冲区回收）的 data 为 nullptr，无需处理
         if (request_context == nullptr) {
             continue;
         }
 
         // ========== 状态机派发 ==========
+        //
+        // 根据请求上下文的当前 state 字段进行条件判断：
+        //   第一优先级：ACCEPTING（新连接接入）
+        //   第二优先级：HEALTH_CHECK_TIMER（定时健康检查）
+        //   第三优先级：操作结果检查（res < 0 则关闭连接）
+        //   第四优先级：具体状态派发（switch）
 
-        // --- Accept 完成 ---
+        // --- 第一优先级：Accept 完成 ---
+        // ACCEPTING 上下文是成员变量（accept_client_ctx_ / accept_backend_ctx_），
+        // 不通过 heap 分配。accept 成功返回新连接的 fd。
         if (request_context->state == RequestContext::ACCEPTING) {
             if (operation_result < 0) {
                 LOG_WARN("[Worker %d] accept 失败 (fd=%d): %s",
@@ -208,7 +267,9 @@ void Worker::worker_loop() {
             continue;
         }
 
-        // --- 健康检查定时器 ---
+        // --- 第二优先级：健康检查定时器 ---
+        // io_uring 的 IORING_OP_TIMEOUT 到期后触发。
+        // 每次触发后重新提交下一次超时请求。
         if (request_context->state == RequestContext::HEALTH_CHECK_TIMER) {
             if (running_) {
                 perform_health_checks();
@@ -217,7 +278,9 @@ void Worker::worker_loop() {
             continue;
         }
 
-        // --- 其他操作失败处理 ---
+        // --- 第三优先级：操作失败处理 ---
+        // 所有非 ACCEPTING/HEALTH_CHECK 操作失败（如 read/write 返回负值）
+        // 统一走 close_connection() 清理资源。
         if (operation_result < 0) {
             LOG_WARN("[Worker %d] %s 操作失败 (fd=%d): %s",
                      worker_id_, state_name(request_context->state),
@@ -226,32 +289,47 @@ void Worker::worker_loop() {
             continue;
         }
 
-        // --- 根据当前状态派发 ---
+        // --- 第四优先级：根据当前状态派发 ---
+        // 各状态对应的事件处理器：
+        //   READING_CLIENT    → handle_client_read()   解析 HTTP 请求，转发到后端
+        //   WRITING_BACKEND   → handle_backend_write()  处理 partial write
+        //   READING_BACKEND   → handle_backend_read()   接收后端响应，写回客户端
+        //   WRITING_CLIENT    → handle_client_write()   写完后 keep-alive / 关闭
+        //   BACKEND_REGISTER  → handle_backend_register() 解析 REGISTER 协议
+        //
+        // 对于使用 IOSQE_BUFFER_SELECT 的读操作（READING_CLIENT 和
+        // READING_BACKEND），内核自动分配缓冲区，buffer_id 存储在
+        // CQE flags 的高 16 位，需提取后设置到 context 中。
         switch (request_context->state) {
             case RequestContext::READING_CLIENT: {
-                int buffer_id = (completion_flags >> 16);
+                // 从 completion_flags 提取 IOSQE_BUFFER_SELECT 分配的 buffer_id
+                int buffer_id = (completion_flags >> 16) & 0xFFFF;
                 request_context->bid = buffer_id;
                 request_context->buffer = buffer_from_bid(buffer_id);
                 handle_client_read(request_context, operation_result);
                 break;
             }
             case RequestContext::WRITING_BACKEND:
+                // 客户端的请求数据已提交到后端；处理 partial write 或发起后端 read
                 handle_backend_write(request_context, operation_result);
                 break;
 
             case RequestContext::READING_BACKEND: {
-                int buffer_id = (completion_flags >> 16);
+                // 同上，提取 buffer_id
+                int buffer_id = (completion_flags >> 16) & 0xFFFF;
                 request_context->bid = buffer_id;
                 request_context->buffer = buffer_from_bid(buffer_id);
                 handle_backend_read(request_context, operation_result);
                 break;
             }
             case RequestContext::WRITING_CLIENT:
+                // 后端响应已写回客户端；处理 partial write 或 keep-alive 逻辑
                 handle_client_write(request_context, operation_result);
                 break;
 
             case RequestContext::BACKEND_REGISTER: {
-                int buffer_id = (completion_flags >> 16);
+                // 后端注册消息读取完成；解析 REGISTER 协议
+                int buffer_id = (completion_flags >> 16) & 0xFFFF;
                 request_context->bid = buffer_id;
                 request_context->buffer = buffer_from_bid(buffer_id);
                 handle_backend_register(request_context, operation_result);
@@ -596,6 +674,14 @@ void Worker::handle_accept(RequestContext* listen_context, int new_fd) {
 }
 
 void Worker::handle_client_read(RequestContext* context, int bytes_read) {
+    //
+    // === 客户端 HTTP 请求处理 ===
+    //
+    // 这是网关最核心的函数之一，处理流程：
+    //   1. 校验读取结果 → 2. 解析 HTTP 请求 → 3. 路由查找
+    //   4. 无可用后端 → 加入等待队列 → 5. JWT 鉴权 → 6. IP 限流
+    //   7. COW 移除后端路由 → 8. 转发请求到后端
+    //
     if (bytes_read <= 0) {
         LOG_WARN("[Worker %d] 客户端读取到 %d 字节，关闭连接 (fd=%d)",
                  worker_id_, bytes_read, context->fd);
@@ -637,22 +723,29 @@ void Worker::handle_client_read(RequestContext* context, int bytes_read) {
              worker_id_, context->client_fd,
              http_method.c_str(), context->path.c_str());
 
-    // 查找后端路由（获取完整 RouteInfo，含鉴权和限流标志）
-    auto table = route_manager_.get_table();
-    RouteInfo route = table->lookup(context->path);
+    // ---- 从连接池获取后端 ----
+    // BackendPool::acquire() 从空闲队列中按最长前缀匹配获取后端 fd。
+    // 由于 BackendPool 是 Worker 线程本地的，无需任何锁或原子操作。
+    // acquire() 会将匹配的后端从空闲队列移除并标记为忙碌（in_use=true）。
+    bool need_auth = false, need_rate_limit = false;
+    int backend_fd = backend_pool_.acquire(
+        context->path, need_auth, need_rate_limit);
 
-    // 无路由匹配 → 返回 502 Bad Gateway
-    if (!route.valid()) {
-        LOG_WARN("[Worker %d] 无路由匹配: %s (client_fd=%d)",
+    if (backend_fd < 0) {
+        // 所有后端连接都忙碌，请求排队
+        LOG_INFO("[Worker %d] 无可用后端，请求排队: %s (client_fd=%d)",
                  worker_id_, context->path.c_str(),
                  context->client_fd);
-        send_http_error(context, 502, "Bad Gateway",
-                        "502 Bad Gateway");
+        context->total_bytes = bytes_read;
+        pending_clients_.push_back(context);
         return;
     }
 
-    // ---- 令牌鉴权检查 ----
-    if (route.need_auth) {
+    // ---- JWT 令牌鉴权 ----
+    // 使用 HS256（HMAC-SHA256）算法验证 Bearer Token。
+    // 如果路径注册了 need_auth=true，所有请求必须携带有效的
+    // Authorization: Bearer <token> 头，否则返回 401。
+    if (need_auth) {
         if (auth_token.empty()) {
             LOG_WARN("[Worker %d] 需要鉴权但缺少 Authorization 头 (fd=%d, path=%s)",
                      worker_id_, context->client_fd,
@@ -678,7 +771,9 @@ void Worker::handle_client_read(RequestContext* context, int bytes_read) {
     }
 
     // ---- IP 限流检查 ----
-    if (route.need_rate_limit) {
+    // 使用滑动窗口算法，按 IP 统计请求次数。
+    // 如果路径注册了 need_rate_limit=true，超过阈值返回 429。
+    if (need_rate_limit) {
         bool request_allowed =
             rate_limiter_.allow(context->client_ip);
         if (!request_allowed) {
@@ -691,19 +786,27 @@ void Worker::handle_client_read(RequestContext* context, int bytes_read) {
         }
     }
 
-    // ---- 所有检查通过，转发到后端 ----
+    //
+    // === 转发请求到后端（BackendPool 独占模式） ===
+    //
+    // BackendPool::acquire() 已从空闲队列中移除了该后端 fd 并标记为忙碌，
+    // 因此当前请求独占该后端连接，同一 Worker 内的其他请求不会重复获取。
+    // 由于每个 Worker 拥有自己的连接池，不存在跨 Worker 的竞态条件。
+    //
+    // 生命周期：
+    //   ① acquire() 获取 fd + 标记忙碌（本函数）
+    //   ② 提交写请求到后端
+    //   ③ 收到后端响应后 release() 放回空闲池（handle_client_write）
+    //   ④ process_pending_requests() 处理等待队列
+    //
     LOG_INFO("[Worker %d] 路由匹配: %s → backend_fd=%d (auth=%s, rate=%s)",
-             worker_id_, context->path.c_str(), route.backend_fd,
-             route.need_auth ? "ON" : "OFF",
-             route.need_rate_limit ? "ON" : "OFF");
+             worker_id_, context->path.c_str(), backend_fd,
+             need_auth ? "ON" : "OFF",
+             need_rate_limit ? "ON" : "OFF");
 
-    // 从路由表中移除该后端，防止其他并发客户端继续使用同一后端连接
-    // 通过 RouteManager 执行 COW，Worker 不直接操作路由表
-    route_manager_.remove_backend(route.backend_fd);
-
-    context->backend_fd = route.backend_fd;
+    context->backend_fd = backend_fd;
     context->state = RequestContext::WRITING_BACKEND;
-    context->fd = route.backend_fd;
+    context->fd = backend_fd;
     context->total_bytes = bytes_read;
     context->bytes_written = 0;
     submit_write(context, context->buffer, bytes_read);
@@ -711,9 +814,16 @@ void Worker::handle_client_read(RequestContext* context, int bytes_read) {
 
 void Worker::handle_backend_write(RequestContext* context,
                                    int bytes_written) {
+    //
+    // === 客户端的请求数据已写入后端 ===
+    //
+    // 如果一次 write 没写完所有数据（partial write），
+    // 继续提交剩余部分的写请求。
+    // 全部写完后，回收缓冲区并发起后端读。
+    //
     context->bytes_written += bytes_written;
 
-    // 如果还没写完所有数据，继续发送剩余部分
+    // 处理 partial write：TCP 不保证一次 send 写完所有数据
     if (context->bytes_written < context->total_bytes) {
         submit_write_remain(context);
         return;
@@ -722,12 +832,13 @@ void Worker::handle_backend_write(RequestContext* context,
     LOG_DEBUG("[Worker %d] 请求已全部发往后端 (fd=%d, %d 字节)",
               worker_id_, context->backend_fd, context->total_bytes);
 
-    // 回收客户端请求的缓冲区
+    // 回收客户端请求的 Provided Buffer，归还内核供复用
     submit_recycle_buffer(context->bid);
     context->bid = -1;
     context->buffer = nullptr;
 
-    // 现在从后端读取响应
+    // 状态转换：WRITING_BACKEND → READING_BACKEND
+    // 现在从该后端连接读取 HTTP 响应
     context->state = RequestContext::READING_BACKEND;
     context->fd = context->backend_fd;
     context->total_bytes = 0;
@@ -737,6 +848,13 @@ void Worker::handle_backend_write(RequestContext* context,
 
 void Worker::handle_backend_read(RequestContext* context,
                                   int bytes_read) {
+    //
+    // === 后端响应已返回 ===
+    //
+    // 将后端返回的 HTTP 响应数据通过 io_uring 写回客户端。
+    // 注意：这里假设后端响应在一个 read 内完整到达（<= 4KB）。
+    // 对于大响应需要多个 read 循环，当前实现简化处理。
+    //
     if (bytes_read <= 0) {
         LOG_WARN("[Worker %d] 后端读取到 %d 字节，关闭连接 (fd=%d)",
                  worker_id_, bytes_read, context->backend_fd);
@@ -757,7 +875,8 @@ void Worker::handle_backend_read(RequestContext* context,
               worker_id_, context->backend_fd,
               bytes_read, context->buffer);
 
-    // 将后端响应写回客户端
+    // 状态转换：READING_BACKEND → WRITING_CLIENT
+    // 将后端响应数据写回客户端连接
     context->state = RequestContext::WRITING_CLIENT;
     context->fd = context->client_fd;
     context->total_bytes = bytes_read;
@@ -770,9 +889,20 @@ static void safe_close_fd(int fd, int listen_fd_client, int listen_fd_backend);
 
 void Worker::handle_client_write(RequestContext* context,
                                   int bytes_written) {
+    //
+    // === 后端响应已全部写回客户端 ===
+    //
+    // 处理流程：
+    //   1. 处理 partial write（如果未写完）
+    //   2. 回收缓冲区
+    //   3. Keep-Alive：将后端设回 BACKEND_IDLE
+    //   4. 通过 COW 将后端连接重新插入路由表
+    //   5. 处理等待队列中的请求
+    //   6. 关闭客户端连接，清理客户端上下文
+    //
     context->bytes_written += bytes_written;
 
-    // 如果还没写完所有数据，继续发送剩余部分
+    // 处理 partial write
     if (context->bytes_written < context->total_bytes) {
         submit_write_remain(context);
         return;
@@ -781,46 +911,62 @@ void Worker::handle_client_write(RequestContext* context,
     LOG_DEBUG("[Worker %d] 响应已全部发回客户端 (fd=%d, %d 字节)",
               worker_id_, context->client_fd, context->total_bytes);
 
-    // 回收缓冲区
+    // 回收后端响应数据的 Provided Buffer
     if (context->bid >= 0) {
         submit_recycle_buffer(context->bid);
         context->bid = -1;
         context->buffer = nullptr;
     }
 
-    // ---- Keep-Alive: 保持后端连接，仅关闭客户端 ----
+    //
+    // === Keep-Alive 机制 ===
+    //
+    // 后端连接是持久的（keep-alive），响应完成后不关闭，
+    // 而是将后端重新插入路由表，供下一个请求复用。
+    //
+    // 流程：
+    //   ① 查找后端自己的 RequestContext（在 ctx_by_fd_ 中）
+    //   ② 状态设为 BACKEND_IDLE，表示空闲可用
+    //   ③ 通过 BackendPool::release() 放回空闲队列（使用注册时保存的 prefix）
+    //   ④ 调用 process_pending_requests() 处理等待队列
+    //   ⑤ 关闭客户端连接（客户端短连接，请求-响应完成后即关闭）
+    //   ⑥ 删除客户端的 RequestContext
+    //
     int backend_fd = context->backend_fd;
     int client_fd  = context->client_fd;
 
-    // 1. 查找后端自己的 RequestContext
+    // 步骤 ①：查找后端上下文
     auto backend_it = ctx_by_fd_.find(backend_fd);
     if (backend_it != ctx_by_fd_.end()) {
         RequestContext* backend_ctx = backend_it->second;
 
-        // 2. 将后端设回 BACKEND_IDLE，等待下一个请求
+        // 步骤 ②：后端设为空闲
         backend_ctx->state = RequestContext::BACKEND_IDLE;
 
-        // 3. 通过 RouteManager COW 重新插入路由
-        if (!backend_ctx->registered_prefix.empty()) {
-            route_manager_.insert_backend(
-                backend_ctx->registered_prefix,
-                backend_fd,
-                backend_ctx->registered_auth,
-                backend_ctx->registered_rate_limit);
-        }
+        // 步骤 ③：将后端释放回连接池
+        // BackendPool::release() 将 fd 标记为空闲并放回空闲队列尾部。
+        // 这样下次 acquire() 时又能拿到该后端。
+        backend_pool_.release(backend_fd);
+
+        // 步骤 ④：后端已重新可用，处理等待队列
+        // 注意：process_pending_requests() 会尝试从队列头部取出
+        // 等待的请求，如果找到可用后端则立即转发。
+        process_pending_requests();
     } else {
-        // 后端上下文已不存在（可能已断开），关闭后端 fd
+        // 后端上下文已消失（可能已断开连接或被 close_connection 清理）
         LOG_WARN("[Worker %d] 后端 fd=%d 上下文已不存在，关闭连接",
                  worker_id_, backend_fd);
         close_connection(context);
         return;
     }
 
-    // 4. 关闭客户端连接
+    // 步骤 ⑤：关闭客户端连接
+    // 客户端 HTTP/1.1 请求完成，关闭连接（不支持 HTTP/1.1 keep-alive）
     safe_close_fd(client_fd, listen_fd_client_, listen_fd_backend_);
     ctx_by_fd_.erase(client_fd);
 
-    // 5. 清理客户端上下文（但保持后端 fd 和路由不变）
+    // 步骤 ⑥：删除客户端的 RequestContext（heap 分配的对象）
+    // 注意：accept 上下文是成员变量，不能 delete
     if (context != &accept_client_ctx_ &&
         context != &accept_backend_ctx_) {
         delete context;
@@ -930,11 +1076,12 @@ void Worker::handle_backend_register(RequestContext* context,
         }
     }
 
-    // 注册路由（通过 RouteManager COW 插入，Worker 不直接操作路由表）
+    // 将后端连接添加到当前 Worker 的连接池
+    // BackendPool::add() 直接在当前 Worker 的线程本地池中操作，无需锁。
     if (!route_prefix.empty()) {
-        route_manager_.insert_backend(route_prefix, context->backend_fd,
-                                      need_auth, need_rate_limit);
-        // 保存注册信息，用于 keep-alive 时重新插入路由
+        backend_pool_.add(context->backend_fd, route_prefix,
+                          need_auth, need_rate_limit);
+        // 保存注册信息，用于后续日志/调试
         context->registered_prefix    = route_prefix;
         context->registered_auth       = need_auth;
         context->registered_rate_limit = need_rate_limit;
@@ -955,18 +1102,105 @@ void Worker::handle_backend_register(RequestContext* context,
     context->state = RequestContext::BACKEND_IDLE;
     LOG_INFO("[Worker %d] 后端 (fd=%d) 注册完成，进入空闲",
              worker_id_, context->backend_fd);
+
+    // 新后端已注册，处理等待队列中的请求
+    process_pending_requests();
 }
 
 // ==================== 辅助方法 ====================
 
 bool Worker::assign_backend(RequestContext* client_context) {
-    auto table = route_manager_.get_table();
-    RouteInfo route = table->lookup(client_context->path);
-    if (!route.valid()) {
+    bool need_auth = false, need_rate_limit = false;
+    int backend_fd = backend_pool_.acquire(
+        client_context->path, need_auth, need_rate_limit);
+    if (backend_fd < 0) {
         return false;
     }
-    client_context->backend_fd = route.backend_fd;
+    client_context->backend_fd = backend_fd;
     return true;
+}
+
+void Worker::process_pending_requests() {
+    //
+    // === 处理等待队列中的请求 ===
+    //
+    // 此函数在以下时机被调用：
+    //   1. handle_client_write() 中，后端响应写完客户端后重新插入路由表时
+    //   2. handle_backend_register() 中，新后端注册完成时
+    //
+    // 策略：FIFO 队列 + 非阻塞处理
+    //   - 从队列头部取出等待最久的请求
+    //   - 检查客户端连接是否仍然有效（可能已超时断开）
+    //   - 查找可用后端（每次重新获取最新路由表）
+    //   - 如果无可用后端，停止处理（队列顺序不变，等待下次被调用）
+    //
+    // 注意：每次循环都重新获取路由表，因为：
+    //   a) 可能有多个后端同时完成并重新插入路由表
+    //   b) 当前 Worker 线程不是唯一会调用此函数的线程
+    //
+    if (pending_clients_.empty()) {
+        return;
+    }
+
+    LOG_DEBUG("[Worker %d] 处理等待队列，当前 %zu 个请求排队",
+              worker_id_, pending_clients_.size());
+
+    // 遍历等待队列（FIFO 顺序）
+    while (!pending_clients_.empty()) {
+        RequestContext* client_ctx = pending_clients_.front();
+
+        // 步骤 1：检查客户端是否已断开
+        // 使用 fcntl(F_GETFD) 非侵入式检查 fd 是否有效，
+        // 避免在已关闭的 fd 上执行 I/O 操作。
+        if (::fcntl(client_ctx->client_fd, F_GETFD) == -1) {
+            // 客户端已断开连接，清理并跳过
+            LOG_DEBUG("[Worker %d] 等待队列中的客户端 (fd=%d) 已断开",
+                      worker_id_, client_ctx->client_fd);
+            pending_clients_.pop_front();
+            // 回收其占用的 Provided Buffer
+            if (client_ctx->bid >= 0) {
+                submit_recycle_buffer(client_ctx->bid);
+                client_ctx->bid = -1;
+                client_ctx->buffer = nullptr;
+            }
+            // 从映射表移除并释放上下文
+            ctx_by_fd_.erase(client_ctx->client_fd);
+            if (client_ctx != &accept_client_ctx_ &&
+                client_ctx != &accept_backend_ctx_) {
+                delete client_ctx;
+            }
+            continue;
+        }
+
+        // 步骤 2：从连接池获取可用后端
+        // BackendPool 是线程本地的，直接 acquire 即可
+        bool need_auth = false, need_rate_limit = false;
+        int backend_fd = backend_pool_.acquire(
+            client_ctx->path, need_auth, need_rate_limit);
+
+        if (backend_fd < 0) {
+            // 仍然没有可用空闲连接，停止处理
+            // 保持队列中剩余元素的顺序，等待下一次被调用
+            LOG_DEBUG("[Worker %d] 等待队列: 仍无可用后端，剩余 %zu 个请求",
+                      worker_id_, pending_clients_.size());
+            break;
+        }
+
+        // 步骤 3：找到可用后端，出队处理
+        pending_clients_.pop_front();
+
+        LOG_INFO("[Worker %d] 等待队列出队: %s → backend_fd=%d (client_fd=%d)",
+                 worker_id_, client_ctx->path.c_str(),
+                 backend_fd, client_ctx->client_fd);
+
+        // 步骤 4：设置上下文并提交写请求
+        // 复用缓冲区中已保存的请求数据（total_bytes 在入队时已设置）
+        client_ctx->backend_fd = backend_fd;
+        client_ctx->state = RequestContext::WRITING_BACKEND;
+        client_ctx->fd = backend_fd;
+        client_ctx->bytes_written = 0;
+        submit_write(client_ctx, client_ctx->buffer, client_ctx->total_bytes);
+    }
 }
 
 /**
@@ -983,6 +1217,20 @@ static void safe_close_fd(int fd,
 }
 
 void Worker::close_connection(RequestContext* context) {
+    //
+    // === 关闭连接并清理资源 ===
+    //
+    // 这是连接生命周期的终结函数。执行以下清理：
+    //   1. 从路由表中移除该后端（如果已注册）
+    //   2. 关闭所有关联的 socket fd（跳过监听套接字）
+    //   3. 从 ctx_by_fd_ 映射表中移除所有关联 fd
+    //   4. 删除 RequestContext（heap 分配的对象）
+    //
+    // 注意：对于客户端连接，context->backend_fd 可能为 -1；
+    // 对于后端连接，context->client_fd 可能为 -1。
+    // current_fd 也可能等于 client_fd 或 backend_fd 之一，
+    // 因此关闭和移除时需要去重。
+    //
     if (!context) {
         return;
     }
@@ -995,15 +1243,16 @@ void Worker::close_connection(RequestContext* context) {
               worker_id_, current_fd, client_fd, backend_fd,
               state_name(context->state));
 
-    // 如果后端已注册，从路由表中移除（通过 RouteManager COW）
-    // 否则残留路由会导致后续请求写入已关闭的 fd，产生 EBADF
+    // 步骤 1：从连接池中移除后端（如果有）
+    // BackendPool::remove() 会将 fd 从空闲队列和条目映射中一并移除。
     if (backend_fd >= 0) {
-        route_manager_.remove_backend(backend_fd);
-        LOG_INFO("[Worker %d] 后端 fd=%d 断开，已从路由表移除",
+        backend_pool_.remove(backend_fd);
+        LOG_INFO("[Worker %d] 后端 fd=%d 断开，已从连接池移除",
                  worker_id_, backend_fd);
     }
 
-    // 关闭 socket（跳过监听套接字）
+    // 步骤 2：关闭所有关联的 socket（跳过监听套接字）
+    // 注意去重：current_fd 可能等于 client_fd 或 backend_fd
     safe_close_fd(current_fd, listen_fd_client_, listen_fd_backend_);
     if (client_fd != current_fd) {
         safe_close_fd(client_fd, listen_fd_client_, listen_fd_backend_);
@@ -1012,7 +1261,7 @@ void Worker::close_connection(RequestContext* context) {
         safe_close_fd(backend_fd, listen_fd_client_, listen_fd_backend_);
     }
 
-    // 从映射表移除
+    // 步骤 3：从 fd 映射表中移除
     if (current_fd >= 0) {
         ctx_by_fd_.erase(current_fd);
     }
@@ -1025,7 +1274,8 @@ void Worker::close_connection(RequestContext* context) {
         ctx_by_fd_.erase(backend_fd);
     }
 
-    // 如果是 accept 上下文（成员变量），不 delete
+    // 步骤 4：释放 RequestContext 内存
+    // accept 上下文是 Worker 类的成员变量，不能 delete
     if (context == &accept_client_ctx_ ||
         context == &accept_backend_ctx_) {
         return;

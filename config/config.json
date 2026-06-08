@@ -2,8 +2,8 @@
     "client_port": 8888,
     "backend_port": 9999,
     "ring_size": 1024,
-    "worker_processes": 1,
-    "worker_cpu_affinity": ["0001"],
+    "worker_processes": 8,
+    "worker_cpu_affinity": ["00000001","00000010","00000100","00001000","00010000","00100000","01000000","10000000"],
     "health_check_port": 9090,
     "log_level": 1,
     "log_file": "./log/gateway.log"

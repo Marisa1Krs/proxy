@@ -77,7 +77,13 @@ Gateway::~Gateway() {
 // ==================== 公共接口 ====================
 
 void Gateway::run() {
-    // 启动所有 Worker 线程
+    //
+    // === 启动所有 Worker 线程 ===
+    //
+    // 为每个 Worker 创建一个 std::thread，执行 worker_loop()。
+    // worker_loop() 内部会初始化 io_uring、创建 SO_REUSEPORT 监听套接字、
+    // 然后进入事件循环。run() 会阻塞直到所有 Worker 退出。
+    //
     threads_.reserve(worker_count_);
     for (auto* worker : workers_) {
         auto* thread = new std::thread([worker]() {
@@ -88,7 +94,7 @@ void Gateway::run() {
 
     LOG_INFO("所有 Worker 线程已启动，等待退出...");
 
-    // 等待所有 Worker 线程结束
+    // 等待所有 Worker 线程自然结束（事件循环退出后）
     for (auto* thread : threads_) {
         if (thread != nullptr && thread->joinable()) {
             thread->join();
@@ -99,15 +105,30 @@ void Gateway::run() {
 }
 
 void Gateway::stop() {
+    //
+    // === 优雅停止所有 Worker ===
+    //
+    // 两步停止策略：
+    //   1. 设置 running_ = false（原子变量，Worker 事件循环下次迭代时检查）
+    //   2. 向每个 Worker 发送 SIGUSR1，中断 io_uring_wait_cqe() 的阻塞
+    //
+    // 为什么需要 SIGUSR1？
+    //   Worker 事件循环在 io_uring_wait_cqe() 处阻塞等待内核 I/O 完成事件。
+    //   如果当前没有任何 I/O 活动（所有连接空闲），wait 会无限阻塞。
+    //   SIGUSR1 信号会使 wait 返回 -EINTR，触发 running_ 检查并退出循环。
+    //
+    // 信号处理：
+    //   sigusr1_handler（在 main.cpp 中注册）为空函数，仅用于"打断"wait。
+    //
     LOG_INFO("正在停止所有 Worker...");
 
-    // 1. 通知所有 Worker 停止（设置 running_ = false）
+    // 步骤 1：通知所有 Worker 停止（设置 running_ = false）
     for (auto* worker : workers_) {
         worker->stop();
     }
 
-    // 2. 向每个 Worker 线程发送 SIGUSR1，唤醒 io_uring_wait_cqe
-    //    事件循环收到 -EINTR 后会检查 running_ 标志并退出
+    // 步骤 2：向每个 Worker 线程发送 SIGUSR1，唤醒 io_uring_wait_cqe
+    // 事件循环收到 -EINTR 后会检查 running_ 标志并退出
     for (auto* worker : workers_) {
         pthread_t thread_handle = worker->thread_handle();
         if (thread_handle != 0) {

@@ -24,7 +24,7 @@ class Worker;
  *   - io_uring 实例
  *   - 监听套接字（SO_REUSEPORT，内核自动负载均衡）
  *   - Provided Buffers 池（64 × 4KB）
- *   - 路由表（TrieRouter）
+ *   - 后端连接池（BackendPool）
  *   - 连接上下文映射
  *
  * 后端需在每个 Worker 上分别注册路由：

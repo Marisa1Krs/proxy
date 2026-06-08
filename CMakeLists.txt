@@ -30,8 +30,7 @@ set(GATEWAY_SOURCE_FILES
     ${PROJECT_SOURCE_DIR}/src/main.cpp
     ${PROJECT_SOURCE_DIR}/src/gateway.cpp
     ${PROJECT_SOURCE_DIR}/src/worker.cpp
-    ${PROJECT_SOURCE_DIR}/src/router.cpp
-    ${PROJECT_SOURCE_DIR}/src/route_manager.cpp
+    ${PROJECT_SOURCE_DIR}/src/backend_pool.cpp
     ${PROJECT_SOURCE_DIR}/src/mylog.cpp
 )
 
